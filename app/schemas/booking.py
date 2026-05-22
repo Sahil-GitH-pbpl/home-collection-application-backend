@@ -1,4 +1,4 @@
-﻿from datetime import date
+from datetime import date
 from typing import Literal
 
 from pydantic import BaseModel
@@ -11,7 +11,6 @@ class BookingSummary(BaseModel):
     booking_status: int | None = None
     preferred_visit_date: date | None = None
     preferred_time_slot: str | None = None
-    patient_count: int
     source_type: Literal["BOOKING", "APPOINTMENT"] = "BOOKING"
     patient_scope: Literal["APPOINTMENT_SELECTED", "BOOKING_ALL_FALLBACK"] = "BOOKING_ALL_FALLBACK"
     booking_id: int | None = None
@@ -19,7 +18,7 @@ class BookingSummary(BaseModel):
     appointment_no: str | None = None
     caller_mobile: str | None = None
     route: str | None = None
-    patient_names: str | None = None
+    patient_names: list[str] = Field(default_factory=list)
 
 
 class AddressDetails(BaseModel):
@@ -77,6 +76,10 @@ class PatientDetails(BaseModel):
     selected_charge_modes: str | None = None
     selected_panel_companies: str | None = None
     additional_discount_amount: float | None = None
+    appointment_patient_status: int | None = None
+    booking_due_amount: float | None = None
+    booking_extra_amount: float | None = None
+    booking_payment_mode: str | None = None
     tag: str | None = None
     patient_documents: list[dict] = Field(default_factory=list)
     patient_document_urls: list[str] = Field(default_factory=list)
@@ -323,7 +326,6 @@ class BatchMetaPayload(BaseModel):
     rider_name: str | None = None
     handed_over_at: str | None = None
     booking_count: int | None = None
-    patient_count: int | None = None
     tube_count: int | None = None
 
 
@@ -349,3 +351,5 @@ class BatchListItem(BaseModel):
 
 class BatchListResponse(BaseModel):
     items: list[BatchListItem] = Field(default_factory=list)
+
+

@@ -1,4 +1,4 @@
-from pathlib import Path
+﻿from pathlib import Path
 import json
 import logging
 
@@ -89,10 +89,33 @@ class BookingService:
             return {}
         tests_map = payload.get("tests_billing_map") or {}
         pending_map = payload.get("pending_tests_map") or {}
+        parent_context_map = payload.get("parent_context_map") or {}
         allowed = {int(x) for x in (patient_ids or []) if str(x).isdigit()} if patient_ids else None
         result: dict[int, list[dict]] = {}
 
-        all_keys = set(tests_map.keys()) | set(pending_map.keys())
+        def _iter_sections(node: dict) -> list[tuple[dict, dict, list[dict]]]:
+            if not isinstance(node, dict):
+                return []
+            panels = node.get("panels") or []
+            sections: list[tuple[dict, dict, list[dict]]] = []
+            if isinstance(panels, list) and panels:
+                for sec in panels:
+                    if not isinstance(sec, dict):
+                        continue
+                    sections.append((
+                        sec.get("panel") or {},
+                        sec.get("billing") or {},
+                        list(sec.get("selected_tests") or []),
+                    ))
+            else:
+                sections.append((
+                    node.get("panel") or {},
+                    node.get("billing") or {},
+                    list(node.get("selected_tests") or []),
+                ))
+            return sections
+
+        all_keys = set(tests_map.keys()) | set(pending_map.keys()) | set(parent_context_map.keys())
         for pid_key in all_keys:
             try:
                 pid = int(pid_key)
@@ -104,47 +127,191 @@ class BookingService:
             tests_out: list[dict] = []
             seen_codes: set[str] = set()
             parent_codes: set[str] = set()
+            code_meta: dict[str, dict] = {}
 
-            pending_selected = (pending_map.get(pid_key) or {}).get("selected_tests") or []
-            for item in pending_selected:
-                code = self._as_str(item.get("booked_code"))
-                if not code:
-                    continue
-                parent_code = self._as_str(item.get("parent_booked_code"))
-                if parent_code:
-                    parent_codes.add(parent_code)
-                if code in seen_codes:
-                    continue
-                seen_codes.add(code)
-                tests_out.append({
-                    "booked_code": code,
-                    "test_name": self._as_str(item.get("description")) or self._as_str(item.get("test_name")) or code,
-                    "test_status": 0,
-                    # Pending-carried child tests are informational only in appointment scope.
-                    "mrp": 0.0,
-                    "charge": 0.0,
-                    "max_discount": 0.0,
-                })
+            parent_node = parent_context_map.get(pid_key) or parent_context_map.get(str(pid_key)) or {}
+            for panel_meta, billing_meta, selected_rows in _iter_sections(parent_node):
+                panel_company = self._as_str(panel_meta.get("pname"))
+                comp_cat_id = self._as_str(billing_meta.get("comp_cat_id"))
+                for item in selected_rows:
+                    code = self._as_str(item.get("booked_code"))
+                    if not code:
+                        continue
+                    parent_codes.add(code)
+                    meta = code_meta.setdefault(code, {})
+                    if comp_cat_id and not meta.get("comp_cat_id"):
+                        meta["comp_cat_id"] = comp_cat_id
+                    if panel_company and not meta.get("panel_company"):
+                        meta["panel_company"] = panel_company
 
-            tests_selected = (tests_map.get(pid_key) or {}).get("selected_tests") or []
-            for item in tests_selected:
-                code = self._as_str(item.get("booked_code"))
-                if not code or code in seen_codes or code in parent_codes:
-                    continue
-                seen_codes.add(code)
-                tests_out.append({
-                    "booked_code": code,
-                    "test_name": self._as_str(item.get("description")) or self._as_str(item.get("test_name")) or code,
-                    "test_status": 0,
-                    "mrp": self._to_float(item.get("mrp")),
-                    "charge": self._to_float(item.get("charge")),
-                    "max_discount": self._to_float(item.get("max_discount")),
-                })
+            tests_node = tests_map.get(pid_key) or tests_map.get(str(pid_key)) or {}
+            for panel_meta, billing_meta, selected_rows in _iter_sections(tests_node):
+                panel_company = self._as_str(panel_meta.get("pname"))
+                comp_cat_id = self._as_str(billing_meta.get("comp_cat_id"))
+                for item in selected_rows:
+                    code = self._as_str(item.get("booked_code"))
+                    if not code:
+                        continue
+                    meta = code_meta.setdefault(code, {})
+                    if comp_cat_id and not meta.get("comp_cat_id"):
+                        meta["comp_cat_id"] = comp_cat_id
+                    if panel_company and not meta.get("panel_company"):
+                        meta["panel_company"] = panel_company
+
+            pending_node = pending_map.get(pid_key) or pending_map.get(str(pid_key)) or {}
+            for panel_meta, billing_meta, selected_rows in _iter_sections(pending_node):
+                panel_company = self._as_str(panel_meta.get("pname"))
+                comp_cat_id = self._as_str(billing_meta.get("comp_cat_id"))
+                for item in selected_rows:
+                    code = self._as_str(item.get("booked_code"))
+                    if not code:
+                        continue
+                    parent_code = self._as_str(item.get("parent_booked_code"))
+                    root_code = self._as_str(item.get("root_booked_code"))
+                    if parent_code:
+                        parent_codes.add(parent_code)
+                    if root_code:
+                        parent_codes.add(root_code)
+                    if code in seen_codes:
+                        continue
+                    meta = dict(code_meta.get(parent_code or root_code or code, {}))
+                    if comp_cat_id and not meta.get("comp_cat_id"):
+                        meta["comp_cat_id"] = comp_cat_id
+                    if panel_company and not meta.get("panel_company"):
+                        meta["panel_company"] = panel_company
+                    seen_codes.add(code)
+                    tests_out.append({
+                        "booked_code": code,
+                        "comp_cat_id": meta.get("comp_cat_id"),
+                        "panel_company": meta.get("panel_company"),
+                        "test_name": self._as_str(item.get("description")) or self._as_str(item.get("test_name")) or code,
+                        "test_status": 0,
+                        "mrp": 0.0,
+                        "charge": 0.0,
+                        "max_discount": 0.0,
+                    })
+
+            for panel_meta, billing_meta, selected_rows in _iter_sections(tests_node):
+                panel_company = self._as_str(panel_meta.get("pname"))
+                comp_cat_id = self._as_str(billing_meta.get("comp_cat_id"))
+                for item in selected_rows:
+                    code = self._as_str(item.get("booked_code"))
+                    if not code or code in seen_codes or code in parent_codes:
+                        continue
+                    seen_codes.add(code)
+                    tests_out.append({
+                        "booked_code": code,
+                        "comp_cat_id": comp_cat_id,
+                        "panel_company": panel_company,
+                        "test_name": self._as_str(item.get("description")) or self._as_str(item.get("test_name")) or code,
+                        "test_status": 0,
+                        "mrp": self._to_float(item.get("mrp")),
+                        "charge": self._to_float(item.get("charge")),
+                        "max_discount": self._to_float(item.get("max_discount")),
+                    })
 
             result[pid] = tests_out
 
         return result
 
+    def _appointment_payment_snapshot_obj(self, raw_value) -> dict:
+        if isinstance(raw_value, dict):
+            return raw_value
+        if not raw_value:
+            return {}
+        try:
+            parsed = json.loads(raw_value) if isinstance(raw_value, str) else {}
+        except Exception:
+            parsed = {}
+        return parsed if isinstance(parsed, dict) else {}
+
+    def _build_appointment_payment_snapshot(
+        self,
+        appointment_snapshot_raw: str | None,
+        patient_updates: list[dict] | None,
+        payment_screenshot_paths_by_patient: dict[int, list[str]] | None = None,
+        patient_ids: list[int] | None = None,
+        existing_payment_snapshot_raw: str | None = None,
+    ) -> dict:
+        tests_by_patient = self._build_tests_from_appointment_snapshot(
+            appointment_snapshot_raw,
+            patient_ids=patient_ids,
+        )
+        update_map: dict[int, dict] = {}
+        for row in (patient_updates or []):
+            if not isinstance(row, dict):
+                continue
+            try:
+                pid = int(row.get("patient_id") or 0)
+            except Exception:
+                pid = 0
+            if pid > 0:
+                update_map[pid] = row
+
+        payment_rows: list[dict] = []
+        payment_screenshots = {}
+        sub_total = 0.0
+        base_discount = 0.0
+        charge_total = 0.0
+        additional_discount = 0.0
+
+        for pid, tests in (tests_by_patient or {}).items():
+            patient_sub_total = 0.0
+            patient_base_discount = 0.0
+            patient_charge_total = 0.0
+            for test in (tests or []):
+                patient_sub_total += self._to_float(test.get("mrp"))
+                patient_base_discount += self._to_float(test.get("max_discount"))
+                patient_charge_total += self._to_float(test.get("charge"))
+            row = update_map.get(int(pid)) or {}
+            patient_additional = self._to_float(row.get("additional_discount_amount"))
+            patient_total = max(0.0, patient_charge_total - patient_additional)
+            sub_total += patient_sub_total
+            base_discount += patient_base_discount
+            charge_total += patient_charge_total
+            additional_discount += patient_additional
+            screenshots = [str(x).strip() for x in (payment_screenshot_paths_by_patient or {}).get(int(pid), []) if str(x).strip()]
+            if screenshots:
+                payment_screenshots[str(int(pid))] = screenshots
+            payment_rows.append(
+                {
+                    "patient_id": int(pid),
+                    "payment_mode": self._as_str(row.get("payment_mode")),
+                    "payment_amount": self._to_float(row.get("payment_amount")),
+                    "due_amount": self._to_float(row.get("due_amount")),
+                    "extra_amount": self._to_float(row.get("extra_amount")),
+                    "additional_discount_amount": patient_additional,
+                    "payment_screenshot_paths": screenshots,
+                    "total_amount": round(patient_total, 2),
+                }
+            )
+
+        final_discount = base_discount + additional_discount
+        total_amount = max(0.0, charge_total - additional_discount)
+        existing_payment_snapshot = self._appointment_payment_snapshot_obj(existing_payment_snapshot_raw)
+        patient_context = existing_payment_snapshot.get("patient_context") if isinstance(existing_payment_snapshot.get("patient_context"), dict) else {}
+        return {
+            "payments": payment_rows,
+            "payment_screenshots": payment_screenshots,
+            "summary": {
+                "sub_total": round(sub_total, 2),
+                "credit_amount": 0.0,
+                "paying_amount": round(charge_total, 2),
+                "base_discount": round(base_discount, 2),
+                "additional_discount": round(additional_discount, 2),
+                "final_discount": round(final_discount, 2),
+                "total_amount": round(total_amount, 2),
+            },
+            "patient_context": patient_context,
+        }
+
+
+    @staticmethod
+    def _split_patient_names(raw: object) -> list[str]:
+        text = BookingService._as_str(raw)
+        if not text:
+            return []
+        return [x.strip() for x in text.split(',') if x and x.strip()]
     def get_my_assigned_bookings(
         self,
         user_id: int,
@@ -164,7 +331,6 @@ class BookingService:
                 booking_status=row.get("booking_status"),
                 preferred_visit_date=row.get("preferred_visit_date"),
                 preferred_time_slot=self._as_str(row.get("preferred_time_slot")),
-                patient_count=int(row.get("patient_count") or 0),
                 source_type=row.get("source_type", "BOOKING"),
                 patient_scope=row.get("patient_scope", "BOOKING_ALL_FALLBACK"),
                 booking_id=row.get("booking_id"),
@@ -172,7 +338,7 @@ class BookingService:
                 appointment_no=self._as_str(row.get("appointment_no")),
                 caller_mobile=self._as_str(row.get("caller_mobile")),
                 route=self._as_str(row.get("route")),
-                patient_names=self._as_str(row.get("patient_names")),
+                patient_names=self._split_patient_names(row.get("patient_names")),
             )
             for row in rows
         ]
@@ -196,7 +362,6 @@ class BookingService:
                 booking_status=row.get("booking_status"),
                 preferred_visit_date=row.get("preferred_visit_date"),
                 preferred_time_slot=self._as_str(row.get("preferred_time_slot")),
-                patient_count=int(row.get("patient_count") or 0),
                 source_type=row.get("source_type", "BOOKING"),
                 patient_scope=row.get("patient_scope", "BOOKING_ALL_FALLBACK"),
                 booking_id=row.get("booking_id"),
@@ -204,7 +369,7 @@ class BookingService:
                 appointment_no=self._as_str(row.get("appointment_no")),
                 caller_mobile=self._as_str(row.get("caller_mobile")),
                 route=self._as_str(row.get("route")),
-                patient_names=self._as_str(row.get("patient_names")),
+                patient_names=self._split_patient_names(row.get("patient_names")),
             )
             for row in rows
         ]
@@ -235,6 +400,8 @@ class BookingService:
         patient_scope = "BOOKING_ALL_FALLBACK"
         selected_patient_ids: list[int] = []
         status_for_response = int(booking.booking_status) if booking.booking_status is not None else None
+        appointment_payment_snapshot = {}
+        appointment_patient_context = {}
         if appointment_id is not None:
             selected_booking_id, appointment_status, selected_patient_ids, patient_scope = self.repository.get_appointment_selected_patient_ids(
                 appointment_id=appointment_id,
@@ -251,6 +418,17 @@ class BookingService:
                     detail="Appointment does not belong to provided booking",
                 )
             status_for_response = appointment_status if appointment_status is not None else status_for_response
+            appt_snapshot_raw = self.repository.get_appointment_tests_snapshot(
+                appointment_id=appointment_id,
+                user_id=user_id,
+            )
+            appointment_payment_snapshot = self._appointment_payment_snapshot_obj(
+                self.repository.db.execute(
+                    text("SELECT payment_snapshot_json FROM hhome_collection_booking_appointment WHERE id=:appointment_id LIMIT 1"),
+                    {"appointment_id": int(appointment_id)},
+                ).scalar()
+            )
+            appointment_patient_context = appointment_payment_snapshot.get("patient_context") if isinstance(appointment_payment_snapshot.get("patient_context"), dict) else {}
 
         patients = self.repository.get_patients_for_booking(
             booking.id,
@@ -288,12 +466,8 @@ class BookingService:
         pending_only_tests = status_for_response in {0, 1, 2}
         tests_by_patient: dict[int, list[dict]] = {}
         if appointment_id is not None:
-            appt_snapshot = self.repository.get_appointment_tests_snapshot(
-                appointment_id=appointment_id,
-                user_id=user_id,
-            )
             tests_by_patient = self._build_tests_from_appointment_snapshot(
-                appt_snapshot,
+                appt_snapshot_raw,
                 patient_ids=selected_patient_ids if selected_patient_ids else None,
             )
         if not tests_by_patient:
@@ -313,6 +487,9 @@ class BookingService:
             selected_charge_modes,
             selected_panel_companies,
             additional_discount_amount,
+            payment_mode,
+            due_amount,
+            extra_amount,
             bp_prescription_files,
             patient,
         ) in patients:
@@ -338,11 +515,13 @@ class BookingService:
                 f"/static/uploads/prescriptions/{name}"
                 for name in prescription_files
             ]
+            patient_ctx = appointment_patient_context.get(str(int(patient.id))) if appointment_id is not None else None
+            patient_ctx = patient_ctx if isinstance(patient_ctx, dict) else {}
             patient_items.append(
                 PatientDetails(
                     id=patient.id,
                     booking_patient_id=int(booking_patient_id),
-                    booking_patient_status=int(booking_patient_status or 0),
+                    booking_patient_status=(None if appointment_id is not None else int(booking_patient_status or 0)),
                     test_booking_status=self._as_str(test_booking_status),
                     title=patient.title,
                     full_name=patient.full_name,
@@ -358,7 +537,11 @@ class BookingService:
                     selected_comp_cat_ids=self._as_str(selected_comp_cat_ids),
                     selected_charge_modes=self._as_str(selected_charge_modes),
                     selected_panel_companies=self._as_str(selected_panel_companies),
-                    additional_discount_amount=self._to_float(additional_discount_amount),
+                    additional_discount_amount=(self._to_float(patient_ctx.get("appointment_additional_discount_amount")) if appointment_id is not None else self._to_float(additional_discount_amount)),
+                    appointment_patient_status=(int(patient_ctx.get("appointment_patient_status")) if patient_ctx.get("appointment_patient_status") is not None else None),
+                    booking_due_amount=self._to_float(patient_ctx.get("booking_due_amount") if appointment_id is not None else due_amount),
+                    booking_extra_amount=self._to_float(patient_ctx.get("booking_extra_amount") if appointment_id is not None else extra_amount),
+                    booking_payment_mode=(self._as_str(patient_ctx.get("booking_payment_mode")) if appointment_id is not None else self._as_str(payment_mode)),
                     tag=patient.tag,
                     patient_documents=patient_documents,
                     patient_document_urls=patient_document_urls,
@@ -391,6 +574,17 @@ class BookingService:
                     )
                 )
 
+        response_F_Apt_Am = float(getattr(booking, 'F_Apt_Am', 0) or 0)
+        response_F_dis = float(getattr(booking, 'F_dis', 0) or 0)
+        response_Ad_Dis = float(getattr(booking, 'Ad_Dis', 0) or 0)
+        response_total_amount = float(getattr(booking, 'total_amount', 0) or 0)
+        if appointment_id is not None:
+            summary = appointment_payment_snapshot.get("summary") if isinstance(appointment_payment_snapshot.get("summary"), dict) else {}
+            response_F_Apt_Am = self._to_float(summary.get("sub_total"))
+            response_F_dis = self._to_float(summary.get("final_discount"))
+            response_Ad_Dis = self._to_float(summary.get("additional_discount"))
+            response_total_amount = self._to_float(summary.get("total_amount"))
+
         return BookingDetailsResponse(
             booking_status=status_for_response,
             source_type="APPOINTMENT" if appointment_id is not None else "BOOKING",
@@ -399,10 +593,10 @@ class BookingService:
             address=AddressDetails.model_validate(address) if address else None,
             patients=patient_items,
             linked_patients=linked_patient_items,
-            F_Apt_Am=float(getattr(booking, 'F_Apt_Am', 0) or 0),
-            F_dis=float(getattr(booking, 'F_dis', 0) or 0),
-            Ad_Dis=float(getattr(booking, 'Ad_Dis', 0) or 0),
-            total_amount=float(getattr(booking, 'total_amount', 0) or 0),
+            F_Apt_Am=response_F_Apt_Am,
+            F_dis=response_F_dis,
+            Ad_Dis=response_Ad_Dis,
+            total_amount=response_total_amount,
             referred_by=self._as_str(getattr(booking, 'referred_by', None)),
             intrnl_rfrncd_by=self._as_str(getattr(booking, 'intrnl_rfrncd_by', None)),
         )
@@ -452,6 +646,7 @@ class BookingService:
                 completion_lock_acquired = self.repository.acquire_booking_completion_lock(booking.id, wait_timeout_sec=120)
 
             if normalized_action == "complete" and payload is not None:
+                appointment_payment_screenshot_paths: dict[int, list[str]] = {}
                 incoming_tests = getattr(payload, "tests_payload", None)
                 if incoming_tests and appointment_id is None:
                     save_payload = MobileBookingTestsSaveRequest.model_validate({
@@ -477,6 +672,7 @@ class BookingService:
                         booking_id=booking.id,
                         updates=patient_updates,
                         actor_user_id=user_id,
+                        include_payment_fields=(appointment_id is None),
                     )
                     self.repository.handle_cancelled_patient_reschedule(
                         booking_id=booking.id,
@@ -619,11 +815,14 @@ class BookingService:
                             name_mode="pay",
                         )
                         if paths:
-                            self.repository.set_patient_payment_screenshots(
-                                booking_id=booking.id,
-                                patient_id=patient_id,
-                                rel_paths=paths,
-                            )
+                            if appointment_id is not None:
+                                appointment_payment_screenshot_paths[int(patient_id)] = paths
+                            else:
+                                self.repository.set_patient_payment_screenshots(
+                                    booking_id=booking.id,
+                                    patient_id=patient_id,
+                                    rel_paths=paths,
+                                )
 
                 followup_required = bool(getattr(payload, "followup_required", False))
                 pending_child_rows = (getattr(payload, "pending_child_tests", None) or [])
@@ -653,6 +852,7 @@ class BookingService:
 
                     tests_billing_map: dict[str, dict] = {}
                     pending_tests_map: dict[str, dict] = {}
+                    parent_context_map: dict[str, dict] = {}
                     for row in pending_child_rows:
                         r = row or {}
                         pid = int(r.get("patient_id") or 0)
@@ -661,7 +861,6 @@ class BookingService:
                         key = str(pid)
                         tbs_value = tbs_by_pid.get(pid)
                         root_code = str(r.get("root_booked_code") or "").strip()
-                        root_name = str(r.get("root_test_name") or root_code).strip()
                         pending_items = r.get("pending") or r.get("pending_child_tests") or []
                         child_rows = []
                         for p in pending_items:
@@ -678,8 +877,32 @@ class BookingService:
                                 "max_discount": 0,
                                 "max_allowed_discount": 0,
                             })
+
+                        tests_billing_map.setdefault(key, {
+                            "panel": {"pname": ""},
+                            "billing": {"comp_cat_id": "", "selected_charge_mode": ""},
+                            "selected_tests": [],
+                            "panels": [{
+                                "panel": {"pname": ""},
+                                "billing": {"comp_cat_id": "", "selected_charge_mode": ""},
+                                "selected_tests": [],
+                            }],
+                            "cce_level_tbs": tbs_value,
+                        })
+                        if tests_billing_map[key].get("cce_level_tbs") in (None, "") and tbs_value not in (None, ""):
+                            tests_billing_map[key]["cce_level_tbs"] = tbs_value
+
                         if root_code:
-                            tests_billing_map.setdefault(key, {
+                            root_name = str(r.get("root_test_name") or root_code).strip() or root_code
+                            root_row = {
+                                "booked_code": root_code,
+                                "description": root_name,
+                                "charge": 0,
+                                "mrp": 0,
+                                "max_discount": 0,
+                                "max_allowed_discount": 0,
+                            }
+                            parent_context_map.setdefault(key, {
                                 "panel": {"pname": ""},
                                 "billing": {"comp_cat_id": "", "selected_charge_mode": ""},
                                 "selected_tests": [],
@@ -690,24 +913,17 @@ class BookingService:
                                 }],
                                 "cce_level_tbs": tbs_value,
                             })
-                            if tests_billing_map[key].get("cce_level_tbs") in (None, "") and tbs_value not in (None, ""):
-                                tests_billing_map[key]["cce_level_tbs"] = tbs_value
-                            tests_billing_map[key]["selected_tests"].append({
-                                "booked_code": root_code,
-                                "description": root_name,
-                                "charge": 0,
-                                "mrp": 0,
-                                "max_discount": 0,
-                                "max_allowed_discount": 0,
-                            })
-                            tests_billing_map[key]["panels"][0]["selected_tests"].append({
-                                "booked_code": root_code,
-                                "description": root_name,
-                                "charge": 0,
-                                "mrp": 0,
-                                "max_discount": 0,
-                                "max_allowed_discount": 0,
-                            })
+                            if parent_context_map[key].get("cce_level_tbs") in (None, "") and tbs_value not in (None, ""):
+                                parent_context_map[key]["cce_level_tbs"] = tbs_value
+                            existing_parent = {str(x.get("booked_code") or "").strip().upper() for x in (parent_context_map[key].get("selected_tests") or [])}
+                            if root_code.strip().upper() not in existing_parent:
+                                parent_context_map[key]["selected_tests"].append(dict(root_row))
+                                parent_context_map[key]["panels"][0]["selected_tests"].append(dict(root_row))
+                            existing_root = {str(x.get("booked_code") or "").strip().upper() for x in (tests_billing_map[key].get("selected_tests") or [])}
+                            if root_code.strip().upper() not in existing_root:
+                                tests_billing_map[key]["selected_tests"].append(dict(root_row))
+                                tests_billing_map[key]["panels"][0]["selected_tests"].append(dict(root_row))
+
                         if child_rows:
                             pending_tests_map.setdefault(key, {
                                 "panel": {"pname": ""},
@@ -722,12 +938,20 @@ class BookingService:
                             })
                             if pending_tests_map[key].get("cce_level_tbs") in (None, "") and tbs_value not in (None, ""):
                                 pending_tests_map[key]["cce_level_tbs"] = tbs_value
-                            pending_tests_map[key]["selected_tests"].extend(child_rows)
-                            pending_tests_map[key]["panels"][0]["selected_tests"].extend(child_rows)
+
+                            existing_child = {str(x.get("booked_code") or "").strip().upper() for x in (pending_tests_map[key].get("selected_tests") or [])}
+                            for child in child_rows:
+                                ccode = str(child.get("booked_code") or "").strip().upper()
+                                if not ccode or ccode in existing_child:
+                                    continue
+                                pending_tests_map[key]["selected_tests"].append(child)
+                                pending_tests_map[key]["panels"][0]["selected_tests"].append(child)
+                                existing_child.add(ccode)
 
                     snapshot_payload = {
                         "tests_billing_map": tests_billing_map,
                         "pending_tests_map": pending_tests_map,
+                        "parent_context_map": parent_context_map,
                         "flow_type": "auto_followup_pending_child",
                     }
 
@@ -738,6 +962,33 @@ class BookingService:
                         preferred_slot=getattr(payload, "followup_time_slot", None),
                         selected_patient_ids=selected_ids,
                         appointment_tests_snapshot=snapshot_payload,
+                    )
+                if appointment_id is not None:
+                    appt_snapshot = self.repository.get_appointment_tests_snapshot(
+                        appointment_id=int(appointment_id),
+                        user_id=int(user_id),
+                    )
+                    existing_payment_snapshot_raw = self.repository.db.execute(
+                        text("SELECT payment_snapshot_json FROM hhome_collection_booking_appointment WHERE id=:appointment_id LIMIT 1"),
+                        {"appointment_id": int(appointment_id)},
+                    ).scalar()
+                    _selected_booking_id, _appointment_status, selected_ids, _scope = (
+                        self.repository.get_appointment_selected_patient_ids(
+                            appointment_id=int(appointment_id),
+                            user_id=int(user_id),
+                        )
+                    )
+                    payment_snapshot = self._build_appointment_payment_snapshot(
+                        appointment_snapshot_raw=appt_snapshot,
+                        patient_updates=patient_updates,
+                        payment_screenshot_paths_by_patient=appointment_payment_screenshot_paths,
+                        patient_ids=selected_ids or None,
+                        existing_payment_snapshot_raw=(str(existing_payment_snapshot_raw) if existing_payment_snapshot_raw is not None else None),
+                    )
+                    self.repository.save_appointment_payment_snapshot(
+                        booking_id=int(booking.id),
+                        appointment_id=int(appointment_id),
+                        snapshot_payload=payment_snapshot,
                     )
             if appointment_id is not None:
                 final_status, patient_rows, patient_scope = self.repository.apply_appointment_action(
@@ -1731,4 +1982,6 @@ class BookingService:
             message="Address updated successfully",
             address=AddressDetails.model_validate(updated),
         )
+
+
 

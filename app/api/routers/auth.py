@@ -8,8 +8,8 @@ from app.services.auth_service import AuthService
 
 router = APIRouter(prefix="/api/v1/auth", tags=["Authentication"])
 
-REQUIRED_APP_VERSION_CODE = 1
-REQUIRED_APP_VERSION_NAME = "1.0.0"
+REQUIRED_APP_VERSION_CODE = 2
+REQUIRED_APP_VERSION_NAME = "2.2.1"
 REQUIRED_PLATFORM = "android"
 
 

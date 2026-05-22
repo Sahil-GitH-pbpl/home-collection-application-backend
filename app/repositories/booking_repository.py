@@ -53,6 +53,7 @@ class BookingRepository:
                 HomeCollectionBooking.booking_code,
                 HomeCollectionBooking.preferred_visit_date,
                 HomeCollectionBooking.preferred_time_slot,
+                HomeCollectionBooking.address_snapshot_json,
                 HomeCollectionBooking.booking_status,
                 CallerMaster.full_name.label("caller_name"),
                 CallerMaster.primary_mobile.label("caller_mobile"),
@@ -69,6 +70,7 @@ class BookingRepository:
                 HomeCollectionBooking.booking_code,
                 HomeCollectionBooking.preferred_visit_date,
                 HomeCollectionBooking.preferred_time_slot,
+                HomeCollectionBooking.address_snapshot_json,
                 HomeCollectionBooking.booking_status,
                 CallerMaster.full_name,
                 CallerMaster.primary_mobile,
@@ -80,6 +82,22 @@ class BookingRepository:
         if exclude_cancelled:
             query = query.filter(HomeCollectionBooking.booking_status != 3)
         return query.all()
+
+    @staticmethod
+    def _colony_name_from_snapshot(raw_snapshot: object) -> str | None:
+        if raw_snapshot is None:
+            return None
+        try:
+            snap = json.loads(raw_snapshot) if isinstance(raw_snapshot, str) else raw_snapshot
+        except Exception:
+            return None
+        if not isinstance(snap, dict):
+            return None
+        for key in ("colony_name_snapshot", "colony_name"):
+            value = str(snap.get(key) or "").strip()
+            if value:
+                return value
+        return None
 
     @staticmethod
     def _to_int(value: object) -> int | None:
@@ -493,7 +511,7 @@ class BookingRepository:
                 "caller_mobile": row.caller_mobile,
                 "patient_count": int(row.patient_count or 0),
                 "patient_scope": "BOOKING_ALL_FALLBACK",
-                "route": None,
+                "route": self._colony_name_from_snapshot(getattr(row, "address_snapshot_json", None)),
             }
             for row in booking_rows
         ]
@@ -596,6 +614,9 @@ class BookingRepository:
                 HomeCollectionBookingPatient.selected_charge_modes,
                 HomeCollectionBookingPatient.selected_panel_companies,
                 HomeCollectionBookingPatient.additional_discount_amount,
+                HomeCollectionBookingPatient.payment_mode,
+                HomeCollectionBookingPatient.due_amount,
+                HomeCollectionBookingPatient.extra_amount,
                 HomeCollectionBookingPatient.prescription_files.label("bp_prescription_files"),
                 PatientMaster,
             )
@@ -639,6 +660,114 @@ class BookingRepository:
             ),
             params,
         ).mappings().all()
+
+    def _appointment_payment_snapshot_obj(self, raw_value) -> dict:
+        if isinstance(raw_value, dict):
+            return raw_value
+        if not raw_value:
+            return {}
+        try:
+            parsed = json.loads(raw_value) if isinstance(raw_value, str) else {}
+        except Exception:
+            parsed = {}
+        return parsed if isinstance(parsed, dict) else {}
+
+    def _build_appointment_patient_context(
+        self,
+        booking_id: int,
+        patient_ids: Sequence[int] | None,
+        default_status: int | None = None,
+        existing_context: dict | None = None,
+    ) -> dict:
+        ids = sorted({int(x) for x in (patient_ids or []) if int(x or 0) > 0})
+        out = dict(existing_context or {}) if isinstance(existing_context, dict) else {}
+        if not ids:
+            return out
+        rows = self.db.execute(
+            text(
+                """
+                SELECT patient_id, booking_patient_status, payment_mode, due_amount, extra_amount, additional_discount_amount
+                FROM hhome_collection_booking_patient
+                WHERE booking_id = :booking_id
+                  AND patient_id IN :patient_ids
+                """
+            ).bindparams(bindparam("patient_ids", expanding=True)),
+            {"booking_id": int(booking_id), "patient_ids": ids},
+        ).mappings().all()
+        for row in rows:
+            pid = int(row.get("patient_id") or 0)
+            if pid <= 0:
+                continue
+            existing = out.get(str(pid)) if isinstance(out.get(str(pid)), dict) else {}
+            out[str(pid)] = {
+                "appointment_patient_status": int(existing.get("appointment_patient_status") if existing.get("appointment_patient_status") is not None else (default_status if default_status is not None else 0)),
+                "booking_due_amount": float(row.get("due_amount") or 0),
+                "booking_extra_amount": float(row.get("extra_amount") or 0),
+                "booking_payment_mode": str(row.get("payment_mode") or "").strip() or None,
+                "booking_additional_discount_amount": float(row.get("additional_discount_amount") or 0),
+                "appointment_additional_discount_amount": float(existing.get("appointment_additional_discount_amount") or 0),
+            }
+        return out
+
+    def _save_appointment_patient_context(
+        self,
+        booking_id: int,
+        appointment_id: int,
+        patient_ids: Sequence[int] | None,
+        status_value: int | None = None,
+    ) -> None:
+        appt_cols = self._get_appointment_columns()
+        if "payment_snapshot_json" not in appt_cols:
+            return
+        row = self.db.execute(
+            text(
+                """
+                SELECT payment_snapshot_json
+                FROM hhome_collection_booking_appointment
+                WHERE id = :appointment_id AND booking_id = :booking_id
+                LIMIT 1
+                FOR UPDATE
+                """
+            ),
+            {"appointment_id": int(appointment_id), "booking_id": int(booking_id)},
+        ).mappings().first()
+        if not row:
+            return
+        payload = self._appointment_payment_snapshot_obj(row.get("payment_snapshot_json"))
+        if not isinstance(payload.get("payments"), list):
+            payload["payments"] = []
+        if not isinstance(payload.get("payment_screenshots"), dict):
+            payload["payment_screenshots"] = {}
+        if not isinstance(payload.get("summary"), dict):
+            payload["summary"] = {}
+        existing_ctx = payload.get("patient_context") if isinstance(payload.get("patient_context"), dict) else {}
+        merged_ctx = self._build_appointment_patient_context(
+            booking_id=booking_id,
+            patient_ids=patient_ids,
+            default_status=status_value if status_value is not None else None,
+            existing_context=existing_ctx,
+        )
+        if status_value is not None:
+            for pid in [int(x) for x in (patient_ids or []) if int(x or 0) > 0]:
+                node = merged_ctx.get(str(pid)) if isinstance(merged_ctx.get(str(pid)), dict) else {}
+                node["appointment_patient_status"] = int(status_value)
+                merged_ctx[str(pid)] = node
+        payload["patient_context"] = merged_ctx
+        self.db.execute(
+            text(
+                """
+                UPDATE hhome_collection_booking_appointment
+                SET payment_snapshot_json = :snapshot_json,
+                    updated_at = NOW()
+                WHERE id = :appointment_id AND booking_id = :booking_id
+                """
+            ),
+            {
+                "snapshot_json": json.dumps(payload, ensure_ascii=False),
+                "appointment_id": int(appointment_id),
+                "booking_id": int(booking_id),
+            },
+        )
 
     def get_appointment_tests_snapshot(
         self,
@@ -691,6 +820,33 @@ class BookingRepository:
                 "appointment_id": int(appointment_id),
                 "booking_id": int(booking_id),
                 "user_id": int(user_id),
+            },
+        )
+        self.db.commit()
+
+    def save_appointment_payment_snapshot(
+        self,
+        booking_id: int,
+        appointment_id: int,
+        snapshot_payload: dict,
+    ) -> None:
+        appt_cols = self._get_appointment_columns()
+        if "payment_snapshot_json" not in appt_cols:
+            return
+        self.db.execute(
+            text(
+                """
+                UPDATE hhome_collection_booking_appointment
+                SET payment_snapshot_json = :snapshot_json,
+                    updated_at = NOW()
+                WHERE id = :appointment_id
+                  AND booking_id = :booking_id
+                """
+            ),
+            {
+                "snapshot_json": json.dumps(snapshot_payload or {}, ensure_ascii=False),
+                "appointment_id": int(appointment_id),
+                "booking_id": int(booking_id),
             },
         )
         self.db.commit()
@@ -1294,81 +1450,25 @@ class BookingRepository:
                 },
             )
 
-            if action == "assign":
-                self.db.execute(
-                    text(
-                        f"""
-                        UPDATE hhome_collection_booking_patient
-                        SET booking_patient_status = 1
-                        WHERE booking_id = :booking_id
-                          AND booking_patient_status = 0
-                          {scope_sql}
-                        """
-                    ),
-                    patient_params,
-                )
-            elif action == "start":
-                self.db.execute(
-                    text(
-                        f"""
-                        UPDATE hhome_collection_booking_patient
-                        SET booking_patient_status = 2
-                        WHERE booking_id = :booking_id
-                          AND booking_patient_status IN (0, 1)
-                          {scope_sql}
-                        """
-                    ),
-                    patient_params,
-                )
-            elif action == "stop":
-                self.db.execute(
-                    text(
-                        f"""
-                        UPDATE hhome_collection_booking_patient
-                        SET booking_patient_status = 1
-                        WHERE booking_id = :booking_id
-                          AND booking_patient_status = 2
-                          {scope_sql}
-                        """
-                    ),
-                    patient_params,
-                )
-            elif action == "complete":
-                self.db.execute(
-                    text(
-                        f"""
-                        UPDATE hhome_collection_booking_patient
-                        SET booking_patient_status = 3
-                        WHERE booking_id = :booking_id
-                          AND booking_patient_status IN (0, 1, 2)
-                          {scope_sql}
-                        """
-                    ),
-                    patient_params,
-                )
+            if action == "complete":
                 self._update_pending_tests_status(
                     booking_id=booking_id,
                     to_status=1,
                     patient_ids=selected_ids if selected_ids else None,
                 )
             elif action == "cancel":
-                self.db.execute(
-                    text(
-                        f"""
-                        UPDATE hhome_collection_booking_patient
-                        SET booking_patient_status = 4
-                        WHERE booking_id = :booking_id
-                          AND booking_patient_status IN (0, 1, 2)
-                          {scope_sql}
-                        """
-                    ),
-                    patient_params,
-                )
                 self._update_pending_tests_status(
                     booking_id=booking_id,
                     to_status=2,
                     patient_ids=selected_ids if selected_ids else None,
                 )
+
+            self._save_appointment_patient_context(
+                booking_id=booking_id,
+                appointment_id=appointment_id,
+                patient_ids=selected_ids if selected_ids else None,
+                status_value=final_status,
+            )
             self.db.commit()
         except Exception:
             self.db.rollback()
@@ -2206,6 +2306,7 @@ class BookingRepository:
                 "booking_id": booking_id,
             },
         )
+        self._recompute_booking_amounts_from_active_tests(int(booking_id))
 
         self.db.commit()
         return active_count, dropped_count
@@ -2278,12 +2379,19 @@ class BookingRepository:
                 item = p or {}
                 code = str(item.get("booked_code") or "").strip().upper()
                 parent_code = str(item.get("parent_booked_code") or "").strip().upper()
+                description = str(
+                    item.get("description")
+                    or item.get("test_name")
+                    or item.get("name")
+                    or code
+                ).strip()
                 if not code:
                     continue
                 clean_pending.append(
                     {
                         "booked_code": code,
                         "parent_booked_code": parent_code or None,
+                        "description": description or code,
                     }
                 )
             if not clean_pending:
@@ -2392,7 +2500,13 @@ class BookingRepository:
             {"paths": csv_paths or None, "booking_id": int(booking_id), "patient_id": int(patient_id)},
         )
 
-    def apply_completion_patient_updates(self, booking_id: int, updates: list[dict], actor_user_id: int) -> None:
+    def apply_completion_patient_updates(
+        self,
+        booking_id: int,
+        updates: list[dict],
+        actor_user_id: int,
+        include_payment_fields: bool = True,
+    ) -> None:
         cols = self._get_table_columns("hhome_collection_booking_patient")
         pm_cols = self._get_table_columns("hpatient_master")
         for raw in (updates or []):
@@ -2420,24 +2534,24 @@ class BookingRepository:
                 if rv is not None:
                     updates_sql.append("report_delivery=:report_delivery")
                     params["report_delivery"] = str(rv or "").strip() or None
-            if "payment_mode" in cols:
+            if include_payment_fields and "payment_mode" in cols:
                 pm = row.get("payment_mode")
                 if isinstance(pm, list):
                     pm = ",".join([str(x).strip() for x in pm if str(x).strip()])
                 if pm is not None:
                     updates_sql.append("payment_mode=:payment_mode")
                     params["payment_mode"] = str(pm or "").strip() or None
-            if "payment_amount" in cols:
+            if include_payment_fields and "payment_amount" in cols:
                 pa = row.get("payment_amount")
                 if isinstance(pa, list):
                     pa = ",".join([str(float(x or 0)) for x in pa])
                 if pa is not None:
                     updates_sql.append("payment_amount=:payment_amount")
                     params["payment_amount"] = str(pa or "").strip() or None
-            if "due_amount" in cols and row.get("due_amount") is not None:
+            if include_payment_fields and "due_amount" in cols and row.get("due_amount") is not None:
                 updates_sql.append("due_amount=:due_amount")
                 params["due_amount"] = float(row.get("due_amount") or 0)
-            if "extra_amount" in cols and row.get("extra_amount") is not None:
+            if include_payment_fields and "extra_amount" in cols and row.get("extra_amount") is not None:
                 updates_sql.append("extra_amount=:extra_amount")
                 params["extra_amount"] = float(row.get("extra_amount") or 0)
             if "no_of_pricks" in cols and row.get("no_of_pricks") is not None:
@@ -2452,7 +2566,7 @@ class BookingRepository:
                     aval = ",".join([str(x).strip() for x in aval if str(x).strip()])
                 updates_sql.append("additional_sample=:additional_sample")
                 params["additional_sample"] = str(aval or "").strip() or None
-            if "additional_discount_amount" in cols and row.get("additional_discount_amount") is not None:
+            if include_payment_fields and "additional_discount_amount" in cols and row.get("additional_discount_amount") is not None:
                 updates_sql.append("additional_discount_amount=:additional_discount_amount")
                 params["additional_discount_amount"] = float(row.get("additional_discount_amount") or 0)
 
@@ -2505,6 +2619,8 @@ class BookingRepository:
                     if not any(t.lower() == "tough vein" for t in tags):
                         tags.append("tough vein")
                         self.db.execute(text("UPDATE hpatient_master SET tag=:tag WHERE id=:pid"), {"tag": ",".join(tags), "pid": patient_id})
+
+        self._recompute_booking_amounts_from_active_tests(int(booking_id))
 
     def _is_manual_hcb_slip(self, value: object) -> bool:
         v = str(value or "").strip().lower()
@@ -2791,6 +2907,32 @@ class BookingRepository:
         src_assigned = int(getattr(src, "assigned_phlebotomist_id", 0) or 0)
         should_assign_same_date = bool(src_assigned > 0 and src_date and followup_date and src_date == followup_date)
 
+        # Idempotency guard: avoid duplicate follow-up appointment on quick retry/double-submit.
+        if "preferred_visit_date" in cols and "preferred_time_slot" in cols:
+            dup = self.db.execute(
+                text(
+                    """
+                    SELECT id
+                    FROM hhome_collection_booking_appointment
+                    WHERE booking_id = :booking_id
+                      AND preferred_visit_date = :preferred_visit_date
+                      AND preferred_time_slot = :preferred_time_slot
+                      AND appointment_status IN (0, 1, 2)
+                      AND created_at IS NOT NULL
+                      AND TIMESTAMPDIFF(SECOND, created_at, NOW()) BETWEEN 0 AND 180
+                    ORDER BY id DESC
+                    LIMIT 1
+                    """
+                ),
+                {
+                    "booking_id": int(booking_id),
+                    "preferred_visit_date": preferred_date,
+                    "preferred_time_slot": str(preferred_slot),
+                },
+            ).fetchone()
+            if dup:
+                return
+
         insert_cols = []
         values = []
         params = {}
@@ -2825,6 +2967,32 @@ class BookingRepository:
             insert_cols.append("appointment_tests_snapshot_json")
             values.append(":appointment_tests_snapshot_json")
             params["appointment_tests_snapshot_json"] = json.dumps((appointment_tests_snapshot or {}), ensure_ascii=False)
+        if "payment_snapshot_json" in cols:
+            insert_cols.append("payment_snapshot_json")
+            values.append(":payment_snapshot_json")
+            clean_ids = sorted({int(x) for x in (selected_patient_ids or []) if int(x or 0) > 0})
+            params["payment_snapshot_json"] = json.dumps(
+                {
+                    "payments": [],
+                    "payment_screenshots": {},
+                    "summary": {
+                        "sub_total": 0.0,
+                        "credit_amount": 0.0,
+                        "paying_amount": 0.0,
+                        "base_discount": 0.0,
+                        "additional_discount": 0.0,
+                        "final_discount": 0.0,
+                        "total_amount": 0.0,
+                    },
+                    "patient_context": self._build_appointment_patient_context(
+                        booking_id=int(booking_id),
+                        patient_ids=clean_ids,
+                        default_status=0,
+                        existing_context={},
+                    ),
+                },
+                ensure_ascii=False,
+            )
         if "preferred_visit_date" in cols and preferred_date is not None:
             insert_cols.append("preferred_visit_date")
             values.append(":preferred_visit_date")
@@ -2865,6 +3033,16 @@ class BookingRepository:
             ),
             {"booking_id": int(booking_id)},
         ).mappings().all()
+        patient_amount_rows = self.db.execute(
+            text(
+                f"""
+                SELECT t.patient_id, COALESCE(t.charge,0) AS charge
+                FROM hhome_collection_booking_patient_test t
+                WHERE t.booking_id=:booking_id AND {active_expr} IN (0,1)
+                """
+            ),
+            {"booking_id": int(booking_id)},
+        ).mappings().all()
 
         patient_modes = self.db.execute(
             text(
@@ -2877,11 +3055,19 @@ class BookingRepository:
             {"booking_id": int(booking_id)},
         ).mappings().all()
         mode_map = {int(r.get("patient_id") or 0): str(r.get("selected_charge_modes") or "").upper() for r in patient_modes}
+        patient_addl_map = {int(r.get("patient_id") or 0): float(r.get("additional_discount_amount") or 0) for r in patient_modes}
         addl_total = sum(
             float(r.get("additional_discount_amount") or 0)
             for r in patient_modes
             if int(r.get("booking_patient_status") or 0) != 4
         )
+
+        patient_charge_totals: dict[int, float] = {}
+        for r in patient_amount_rows:
+            pid = int(r.get("patient_id") or 0)
+            if pid <= 0:
+                continue
+            patient_charge_totals[pid] = round(float(patient_charge_totals.get(pid) or 0) + float(r.get("charge") or 0), 2)
 
         subtotal = 0.0
         base_discount = 0.0
@@ -2901,6 +3087,26 @@ class BookingRepository:
 
         final_discount = base_discount + float(addl_total or 0)
         total_amount = max(0.0, subtotal - final_discount)
+
+        patient_cols = self._get_table_columns("hhome_collection_booking_patient")
+        if "patient_final_amount" in patient_cols:
+            for pid, charge_total in patient_charge_totals.items():
+                addl = float(patient_addl_map.get(pid) or 0)
+                patient_final_amount = round(max(0.0, charge_total - addl), 2)
+                self.db.execute(
+                    text(
+                        """
+                        UPDATE hhome_collection_booking_patient
+                        SET patient_final_amount=:patient_final_amount
+                        WHERE booking_id=:booking_id AND patient_id=:patient_id
+                        """
+                    ),
+                    {
+                        "patient_final_amount": patient_final_amount,
+                        "booking_id": int(booking_id),
+                        "patient_id": int(pid),
+                    },
+                )
 
         booking_cols = self._get_table_columns("hhome_collection_booking")
         if {"credit_amount", "paying_amount"}.issubset(booking_cols):

@@ -14,6 +14,7 @@ class HomeCollectionBooking(Base):
     booking_code: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
     caller_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     selected_address_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    address_snapshot_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     preferred_visit_date: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
     preferred_time_slot: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
     booking_status: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
@@ -38,7 +39,11 @@ class HomeCollectionBookingPatient(Base):
     selected_comp_cat_ids: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     selected_charge_modes: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
     selected_panel_companies: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    patient_final_amount: Mapped[Optional[float]] = mapped_column("patient_final_amount", Numeric(12, 2), nullable=True)
     prescription_files: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    payment_mode: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    due_amount: Mapped[Optional[float]] = mapped_column(Numeric(12, 2), nullable=True)
+    extra_amount: Mapped[Optional[float]] = mapped_column(Numeric(12, 2), nullable=True)
     additional_discount_amount: Mapped[Optional[float]] = mapped_column("additional_discount_amount", Numeric(12, 2), nullable=True)
 
 
